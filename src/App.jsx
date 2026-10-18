@@ -329,7 +329,7 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
   for (const [field, address] of [['transaction sender', tx?.from], ['transaction target', tx?.to], ['receipt sender', receipt?.from], ['receipt target', receipt?.to]]) {
     if (address !== null && address !== undefined && !isAddress(address)) throw new Error(`RPC returned an invalid ${field} address.`);
   }
-  for (const [field, value] of [['transaction input', tx?.input ?? tx?.data], ['target bytecode', codeHex]]) {
+  for (const [field, value] of [['transaction input', tx?.input ?? tx?.data]]) {
     if (value !== null && value !== undefined && !isHexData(value)) throw new Error(`RPC returned malformed ${field} data.`);
   }
 
@@ -346,7 +346,7 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
       : Promise.resolve(null),
     tx?.from ? callJsonRpc(foundNetwork.rpcUrl, 'eth_getBalance', [tx.from, blockNum]).catch(() => null) : Promise.resolve(null),
     tx?.to
-      ? callJsonRpc(foundNetwork.rpcUrl, 'eth_getCode', [tx.to, 'latest']).catch(() => '0x')
+      ? callJsonRpc(foundNetwork.rpcUrl, 'eth_getCode', [tx.to, blockNum]).catch(() => null)
       : Promise.resolve(null),
     // Replay at receipt block; in-block state may differ from original execution state.
     tx
@@ -377,6 +377,8 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
       () => null
     )
   ]);
+
+  if (codeHex !== null && !isHexData(codeHex)) throw new Error('RPC returned malformed target bytecode data.');
 
   const statusHex = receipt?.status;
   const status = classifyReceiptStatus(receipt);
