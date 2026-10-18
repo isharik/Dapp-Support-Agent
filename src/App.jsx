@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import octopusImage from '../octo_png.png';
 import { calculateGasMetrics, classifyFailureEvidence, classifyReceiptStatus, decodeRevertData, formatUnits, isAddress, isHexData, mapWithConcurrency, parseHexQuantity, MAX_RPC_CONCURRENCY } from './chain.js';
 import { callJsonRpc } from './rpc.js';
 import { probePharosChainMcp } from './mcp.js';
@@ -79,15 +80,6 @@ const PHAROS_LOGO_PATHS = [
   '/public/pharos_png.png'
 ];
 
-const OCTO_IMAGE_PATHS = [
-  '/octo_png.png',
-  '/octo_png',
-  './octo_png.png',
-  '/octo_png.jpg',
-  '/octo_png.webp',
-  '/public/octo_png.png'
-];
-
 const monotonicNow = () => globalThis.performance.now();
 
 const PharosBrandLogo = ({ className = 'h-10' }) => {
@@ -137,20 +129,11 @@ const PharosBrandLogo = ({ className = 'h-10' }) => {
 };
 
 const PharosOctopusMascot = ({ mood = 'idle', failureCategory = null }) => {
-  const [pathIdx, setPathIdx] = useState(0);
   const [imgFailed, setImgFailed] = useState(false);
 
   const isFailed = mood === 'failed';
   const isPassed = mood === 'passed';
   const isScanning = mood === 'scanning';
-
-  const handleOctoError = () => {
-    if (pathIdx < OCTO_IMAGE_PATHS.length - 1) {
-      setPathIdx((prev) => prev + 1);
-    } else {
-      setImgFailed(true);
-    }
-  };
 
   const speechText = isFailed
     ? 'Oops! It failed!'
@@ -198,12 +181,12 @@ const PharosOctopusMascot = ({ mood = 'idle', failureCategory = null }) => {
               : 'radial-gradient(circle at 52% 48%, #2B7FFF 0%, #0E3EA8 48%, #041036 100%)'
           }}
         >
-          {/* User's octo_png Image from Root/Public Folder */}
+          {/* Imported from the repository root so Vite includes it in production builds. */}
           {!imgFailed ? (
             <img
-              src={OCTO_IMAGE_PATHS[pathIdx]}
+              src={octopusImage}
               alt="Pharos Octopus Mascot"
-              onError={handleOctoError}
+              onError={() => setImgFailed(true)}
               className={`w-full h-full object-cover transition-all duration-500 ${
                 isScanning ? 'scale-105 animate-pulse' : 'hover:scale-105'
               } ${
@@ -215,11 +198,8 @@ const PharosOctopusMascot = ({ mood = 'idle', failureCategory = null }) => {
               }`}
             />
           ) : (
-            <div className="flex flex-col items-center justify-center p-2 text-center text-white">
-              <span className="text-2xl">🐙</span>
-              <span className="text-[10px] font-mono mt-0.5 opacity-90">
-                octo_png.png
-              </span>
+            <div role="img" aria-label="Pharos octopus mascot image unavailable" className="p-2 text-center text-xs font-semibold text-white">
+              Mascot image unavailable
             </div>
           )}
 
