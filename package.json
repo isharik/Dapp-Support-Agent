@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:ai-proxy": "node server/ai-proxy.js",
     "build": "vite build",
     "lint": "oxlint",
+    "test": "node --test",
     "preview": "vite preview"
   },
   "dependencies": {

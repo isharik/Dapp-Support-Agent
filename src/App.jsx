@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { calculateGasMetrics, classifyFailureEvidence, classifyReceiptStatus, decodeRevertData, formatUnits, isAddress, isHexData, mapWithConcurrency, parseHexQuantity, MAX_RPC_CONCURRENCY } from './chain.js';
+import { callJsonRpc } from './rpc.js';
+import { probePharosChainMcp } from './mcp.js';
 import {
   Search,
   Activity,
@@ -18,11 +21,9 @@ import {
   Layers,
   ArrowRight,
   Compass,
-  SlidersHorizontal,
   Info,
   Zap,
   Code2,
-  HelpCircle,
   ChevronRight
 } from 'lucide-react';
 
@@ -65,160 +66,8 @@ const PHAROS_NETWORKS = {
   }
 };
 
-const KNOWN_ERROR_SIGNATURES = {
-  '0x08c379a0': { name: 'Error(string)', type: 'Custom Revert Reason' },
-  '0x4e487b71': { name: 'Panic(uint256)', type: 'Solidity Panic / Arithmetic Overflow' },
-  '0xfb8f41b2': { name: 'ERC20InsufficientAllowance(address,uint256,uint256)', type: 'Insufficient Token Allowance' },
-  '0xe450d38c': { name: 'ERC20InsufficientBalance(address,uint256,uint256)', type: 'Insufficient Token Balance' },
-  '0xf4d678b8': { name: 'InsufficientBalance()', type: 'Insufficient Balance' },
-  '0x13be252b': { name: 'InsufficientAllowance()', type: 'Insufficient Allowance' },
-  '0x8baa579f': { name: 'InvalidSignature()', type: 'Invalid Signature / Permit Expired' },
-  '0x3ee5aeb5': { name: 'ReentrancyGuardReentrantCall()', type: 'Reentrancy Guard Triggered' },
-  '0x118cdaa7': { name: 'OwnableUnauthorizedAccount(address)', type: 'Unauthorized Caller (Not Owner)' },
-  '0x7939f424': { name: 'TransferFailed()', type: 'Token Transfer Failed' },
-  '0x90b8ec18': { name: 'TransferSelectorFailed()', type: 'Token Transfer Reverted' },
-  '0x0dc149f0': { name: 'SlippageExceeded()', type: 'DEX Slippage Tolerance Exceeded' },
-  '0x48fee69c': { name: 'ExpiredDeadline()', type: 'Transaction Deadline Expired' }
-};
-
-const PANIC_CODES = {
-  0x01: 'Assertion failed inside the smart contract (assert(false)).',
-  0x11: 'Arithmetic overflow or underflow occurred while calculating token amounts.',
-  0x12: 'The smart contract attempted to divide or modulo by zero.',
-  0x21: 'Converted a value into an invalid enum type.',
-  0x31: 'pop() was called on an empty array in storage.',
-  0x32: 'Array index out-of-bounds access in the smart contract.',
-  0x41: 'Allocated too much memory in a single contract execution.',
-  0x51: 'Called a zero-initialized internal function pointer.'
-};
-
 function hexToBigInt(hex) {
-  if (!hex || hex === '0x') return 0n;
-  try {
-    return BigInt(hex);
-  } catch {
-    return 0n;
-  }
-}
-
-function formatUnits(weiHex, decimals = 18, precision = 5) {
-  const val = hexToBigInt(weiHex);
-  if (val === 0n) return '0';
-  const divisor = 10n ** BigInt(decimals);
-  const whole = val / divisor;
-  const fraction = val % divisor;
-  const fractionStr = fraction.toString().padStart(decimals, '0').slice(0, precision).replace(/0+$/, '');
-  return fractionStr ? `${whole.toString()}.${fractionStr}` : whole.toString();
-}
-
-function decodeHexRevertString(hexData) {
-  if (!hexData || typeof hexData !== 'string' || !hexData.startsWith('0x') || hexData.length <= 2) {
-    return null;
-  }
-  const selector = hexData.slice(0, 10).toLowerCase();
-
-  // Standard Error(string) -> 0x08c379a0
-  if (selector === '0x08c379a0' && hexData.length >= 138) {
-    try {
-      const lengthHex = '0x' + hexData.slice(74, 138);
-      const strLen = Number(hexToBigInt(lengthHex));
-      const strHex = hexData.slice(138, 138 + strLen * 2);
-      let decoded = '';
-      for (let i = 0; i < strHex.length; i += 2) {
-        const code = parseInt(strHex.slice(i, i + 2), 16);
-        if (code >= 32 && code <= 126) decoded += String.fromCharCode(code);
-      }
-      return {
-        category: 'Revert Reason',
-        signature: 'Error(string)',
-        rawReason: decoded || 'Contract explicitly reverted with Error(string)',
-        decodedType: 'Explicit Revert String'
-      };
-    } catch {
-      return {
-        category: 'Revert Reason',
-        signature: 'Error(string)',
-        rawReason: 'Smart contract execution reverted.',
-        decodedType: 'Explicit Revert'
-      };
-    }
-  }
-
-  // Solidity Panic(uint256) -> 0x4e487b71
-  if (selector === '0x4e487b71' && hexData.length >= 74) {
-    const code = Number(hexToBigInt('0x' + hexData.slice(10, 74)));
-    const panicDesc = PANIC_CODES[code] || `Solidity Panic Code 0x${code.toString(16)}`;
-    return {
-      category: code === 0x11 ? 'Insufficient Balance / Overflow' : 'Revert Reason',
-      signature: `Panic(0x${code.toString(16)})`,
-      rawReason: panicDesc,
-      decodedType: 'Solidity Panic'
-    };
-  }
-
-  // OpenZeppelin ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed)
-  if (selector === '0xe450d38c' && hexData.length >= 202) {
-    const balance = formatUnits('0x' + hexData.slice(74, 138), 18, 4);
-    const needed = formatUnits('0x' + hexData.slice(138, 202), 18, 4);
-    return {
-      category: 'Insufficient Balance',
-      signature: 'ERC20InsufficientBalance(address,uint256,uint256)',
-      rawReason: `Token balance (${balance}) is lower than required transfer amount (${needed}).`,
-      decodedType: 'ERC20 Balance Revert'
-    };
-  }
-
-  // OpenZeppelin ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed)
-  if (selector === '0xfb8f41b2' && hexData.length >= 202) {
-    const allowance = formatUnits('0x' + hexData.slice(74, 138), 18, 4);
-    const needed = formatUnits('0x' + hexData.slice(138, 202), 18, 4);
-    return {
-      category: 'Insufficient Allowance',
-      signature: 'ERC20InsufficientAllowance(address,uint256,uint256)',
-      rawReason: `Approved token spending allowance (${allowance}) is less than needed (${needed}).`,
-      decodedType: 'ERC20 Allowance Revert'
-    };
-  }
-
-  if (KNOWN_ERROR_SIGNATURES[selector]) {
-    const known = KNOWN_ERROR_SIGNATURES[selector];
-    return {
-      category: known.type.includes('Allowance')
-        ? 'Insufficient Allowance'
-        : known.type.includes('Balance')
-        ? 'Insufficient Balance'
-        : 'Revert Reason',
-      signature: known.name,
-      rawReason: `Contract reverted with custom error ${known.name}`,
-      decodedType: known.type
-    };
-  }
-
-  // Try raw ASCII fallback if printable
-  let ascii = '';
-  for (let i = 2; i < Math.min(hexData.length, 260); i += 2) {
-    const code = parseInt(hexData.slice(i, i + 2), 16);
-    if (code >= 32 && code <= 126) ascii += String.fromCharCode(code);
-  }
-  if (ascii.trim().length > 4) {
-    const lower = ascii.toLowerCase();
-    let category = 'Revert Reason';
-    if (lower.includes('allowance') || lower.includes('approve')) category = 'Insufficient Allowance';
-    else if (lower.includes('balance') || lower.includes('amount exceeds')) category = 'Insufficient Balance';
-    return {
-      category,
-      signature: selector,
-      rawReason: ascii.trim(),
-      decodedType: 'Decoded String'
-    };
-  }
-
-  return {
-    category: 'Revert Reason',
-    signature: selector,
-    rawReason: `Custom contract error selector ${selector}`,
-    decodedType: 'Custom Contract Revert'
-  };
+  return parseHexQuantity(hex);
 }
 
 const PHAROS_LOGO_PATHS = [
@@ -238,6 +87,8 @@ const OCTO_IMAGE_PATHS = [
   '/octo_png.webp',
   '/public/octo_png.png'
 ];
+
+const monotonicNow = () => globalThis.performance.now();
 
 const PharosBrandLogo = ({ className = 'h-10' }) => {
   const [pathIdx, setPathIdx] = useState(0);
@@ -427,74 +278,6 @@ const PharosOctopusMascot = ({ mood = 'idle', failureCategory = null }) => {
   );
 };
 
-async function callPharosRpc(rpcUrl, method, params = []) {
-  const response = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method,
-      params
-    })
-  });
-  if (!response.ok) {
-    throw new Error(`RPC HTTP ${response.status}`);
-  }
-  const data = await response.json();
-  if (data.error) {
-    const err = new Error(data.error.message || 'RPC Error');
-    err.code = data.error.code;
-    err.data = data.error.data;
-    throw err;
-  }
-  return data.result;
-}
-
-async function probePharosChainMcp(mcpUrl, txHash, chainId) {
-  const start = performance.now();
-  try {
-    const response = await fetch(mcpUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream'
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: {
-          name: 'get_transaction',
-          arguments: { txHash, chainId }
-        }
-      })
-    });
-    const latency = Math.round(performance.now() - start);
-    if (response.ok) {
-      const text = await response.text();
-      return {
-        transport: 'Pharos Chain MCP (https://mcp.pharos.xyz/mcp)',
-        mcpStatus: 'Connected (200 OK)',
-        latencyMs: latency,
-        rawPreview: text.slice(0, 200)
-      };
-    }
-    return {
-      transport: 'Pharos Chain MCP + JSON-RPC Bridge',
-      mcpStatus: `MCP Endpoint Reachable (HTTP ${response.status})`,
-      latencyMs: latency
-    };
-  } catch {
-    const latency = Math.round(performance.now() - start);
-    return {
-      transport: 'Pharos Direct JSON-RPC (Chain MCP Spec)',
-      mcpStatus: 'Direct RPC Active',
-      latencyMs: latency
-    };
-  }
-}
-
 async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlantic') {
   const cleanHash = txHash.trim();
   if (!/^0x([A-Fa-f0-9]{64})$/.test(cleanHash)) {
@@ -510,52 +293,64 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
   let foundNetwork = null;
   let tx = null;
   let receipt = null;
+  let healthyRpcCount = 0;
+  const networkErrors = [];
 
   for (const net of networkOrder) {
     try {
+      const reportedChainId = await callJsonRpc(net.rpcUrl, 'eth_chainId', []);
+      if (parseHexQuantity(reportedChainId, 'chain ID') !== BigInt(net.chainId)) throw new Error(`RPC chain ID mismatch for ${net.name}.`);
       const [txRes, receiptRes] = await Promise.all([
-        callPharosRpc(net.rpcUrl, 'eth_getTransactionByHash', [cleanHash]),
-        callPharosRpc(net.rpcUrl, 'eth_getTransactionReceipt', [cleanHash])
+        callJsonRpc(net.rpcUrl, 'eth_getTransactionByHash', [cleanHash]),
+        callJsonRpc(net.rpcUrl, 'eth_getTransactionReceipt', [cleanHash])
       ]);
+      healthyRpcCount += 1;
       if (txRes || receiptRes) {
         foundNetwork = net;
         tx = txRes;
         receipt = receiptRes;
         break;
       }
-    } catch {
-      // Continue trying next Pharos network
+    } catch (error) {
+      networkErrors.push(`${net.name}: ${error.message}`);
     }
   }
 
   if (!foundNetwork || (!tx && !receipt)) {
+    if (healthyRpcCount === 0) throw new Error(`All configured Pharos RPC endpoints failed validation. ${networkErrors.join(' ')}`);
     throw new Error(
       `Transaction ${cleanHash.slice(0, 12)}... was not found on Pharos Atlantic Testnet, Pacific Mainnet, or Legacy Testnet. Verify the hash on PharosScan.`
     );
+  }
+  if (tx?.hash && tx.hash.toLowerCase() !== cleanHash.toLowerCase()) throw new Error('RPC returned a transaction with a mismatched hash.');
+  if (receipt?.transactionHash && receipt.transactionHash.toLowerCase() !== cleanHash.toLowerCase()) throw new Error('RPC returned a receipt with a mismatched transaction hash.');
+  if (tx !== null && (typeof tx !== 'object' || Array.isArray(tx))) throw new Error('RPC returned a malformed transaction object.');
+  if (receipt !== null && (typeof receipt !== 'object' || Array.isArray(receipt))) throw new Error('RPC returned a malformed receipt object.');
+  for (const [field, address] of [['transaction sender', tx?.from], ['transaction target', tx?.to], ['receipt sender', receipt?.from], ['receipt target', receipt?.to]]) {
+    if (address !== null && address !== undefined && !isAddress(address)) throw new Error(`RPC returned an invalid ${field} address.`);
+  }
+  for (const [field, value] of [['transaction input', tx?.input ?? tx?.data], ['target bytecode', codeHex]]) {
+    if (value !== null && value !== undefined && !isHexData(value)) throw new Error(`RPC returned malformed ${field} data.`);
   }
 
   // Fetch additional live context via RPC & Chain MCP in parallel:
   // 1. Block details (timestamp, gasLimit)
   // 2. Sender current balance
   // 3. Target bytecode (is contract?)
-  // 4. Replay via eth_call & debug_traceTransaction to extract exact revert reason
+  // eth_call replays against block state and is diagnostic evidence, not the mined receipt.
   const blockNum = receipt?.blockNumber || tx?.blockNumber || 'latest';
   const [mcpProbe, blockData, senderBalanceHex, codeHex, callReplayResult, debugTraceResult] = await Promise.all([
     probePharosChainMcp(foundNetwork.mcpUrl, cleanHash, foundNetwork.chainId),
     blockNum !== 'latest'
-      ? callPharosRpc(foundNetwork.rpcUrl, 'eth_getBlockByNumber', [blockNum, false]).catch(() => null)
+      ? callJsonRpc(foundNetwork.rpcUrl, 'eth_getBlockByNumber', [blockNum, false]).catch(() => null)
       : Promise.resolve(null),
-    tx?.from
-      ? callPharosRpc(foundNetwork.rpcUrl, 'eth_getBalance', [tx.from, blockNum]).catch(() =>
-          callPharosRpc(foundNetwork.rpcUrl, 'eth_getBalance', [tx.from, 'latest']).catch(() => '0x0')
-        )
-      : Promise.resolve('0x0'),
+    tx?.from ? callJsonRpc(foundNetwork.rpcUrl, 'eth_getBalance', [tx.from, blockNum]).catch(() => null) : Promise.resolve(null),
     tx?.to
-      ? callPharosRpc(foundNetwork.rpcUrl, 'eth_getCode', [tx.to, 'latest']).catch(() => '0x')
-      : Promise.resolve('0x'),
-    // Replay the exact transaction at the block it was mined to capture any revert data
+      ? callJsonRpc(foundNetwork.rpcUrl, 'eth_getCode', [tx.to, 'latest']).catch(() => '0x')
+      : Promise.resolve(null),
+    // Replay at receipt block; in-block state may differ from original execution state.
     tx
-      ? callPharosRpc(
+      ? callJsonRpc(
           foundNetwork.rpcUrl,
           'eth_call',
           [
@@ -578,40 +373,42 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
           }))
       : Promise.resolve(null),
     // Try debug_traceTransaction (supported by Pharos RPC docs)
-    callPharosRpc(foundNetwork.rpcUrl, 'debug_traceTransaction', [cleanHash, { tracer: 'callTracer' }]).catch(
+    callJsonRpc(foundNetwork.rpcUrl, 'debug_traceTransaction', [cleanHash, { tracer: 'callTracer' }]).catch(
       () => null
     )
   ]);
 
   const statusHex = receipt?.status;
-  const isSuccess = statusHex === '0x1';
-  const gasLimit = hexToBigInt(tx?.gas || '0x0');
-  const gasUsed = hexToBigInt(receipt?.gasUsed || '0x0');
-  const gasRatio = gasLimit > 0n ? Number((gasUsed * 10000n) / gasLimit) / 100 : 0;
-  const effectiveGasPrice = hexToBigInt(receipt?.effectiveGasPrice || tx?.gasPrice || '0x0');
-  const feeWei = gasUsed * effectiveGasPrice;
-  const valueWei = hexToBigInt(tx?.value || '0x0');
-  const senderBalanceWei = hexToBigInt(senderBalanceHex || '0x0');
+  const status = classifyReceiptStatus(receipt);
+  if (status === 'UNSUPPORTED') throw new Error(`Unsupported receipt status returned by ${foundNetwork.name}: ${String(statusHex)}`);
+  const isSuccess = status === 'PASSED';
+  const metrics = calculateGasMetrics(tx, receipt);
+  const gasLimit = metrics.gasLimit ?? 0n;
+  const gasUsed = metrics.gasUsed ?? 0n;
+  const gasRatio = metrics.gasRatio;
+  const feeWei = metrics.feeWei;
   const inputData = tx?.input || tx?.data || '0x';
   const methodSelector = inputData.length >= 10 ? inputData.slice(0, 10).toLowerCase() : '0x (Native Transfer)';
   const isContractInteraction = codeHex && codeHex !== '0x' && codeHex !== '0x0';
 
   // Determine exact failure cause if status === 0x0
   let diagnosis = {
-    isFailed: !isSuccess,
-    category: isSuccess ? 'Transaction Confirmed' : 'Revert Reason',
-    failureCode: isSuccess ? 'SUCCESS_0x1' : 'EVM_REVERT',
-    technicalReason: isSuccess
-      ? 'Execution completed with status 0x1 without errors.'
-      : 'Execution reverted during smart contract call.',
+    isFailed: status === 'FAILED',
+    category: status === 'PENDING' ? 'Pending / Receipt Unavailable' : isSuccess ? 'Transaction Confirmed' : 'Revert Reason',
+    failureCode: status === 'PENDING' ? 'RECEIPT_UNAVAILABLE' : isSuccess ? 'SUCCESS_0x1' : 'EVM_REVERT',
+    technicalReason: status === 'PENDING' ? 'The transaction has no mined receipt yet; execution status is unavailable.' : isSuccess
+      ? 'Execution completed with receipt status 0x1.' : 'The mined receipt reports status 0x0.',
     plainExplanation: '',
     suggestedFixes: [],
     revertHex: null
   };
 
-  if (isSuccess) {
+  if (status === 'PENDING') {
+    diagnosis.plainExplanation = 'This transaction is known to the RPC, but there is no receipt yet. It may still be pending; inspect it again after confirmation.';
+    diagnosis.suggestedFixes = ['Wait for confirmation and inspect the transaction again.', 'A simulation result is not a mined transaction result.'];
+  } else if (isSuccess) {
     diagnosis.plainExplanation =
-      'Great news! Your transaction went through smoothly on the Pharos blockchain. All token transfers or smart contract actions inside this transaction are permanently confirmed.';
+      'The Pharos receipt confirms successful EVM execution. Check the transaction logs or the DApp state to confirm the specific result you expected.';
     diagnosis.suggestedFixes = [
       'No fix needed — your transaction succeeded on-chain.',
       'If a token balance does not appear in your wallet yet, refresh your wallet or import the token contract address.',
@@ -622,11 +419,6 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
     const traceError = debugTraceResult?.error || '';
     const traceRevertReason = debugTraceResult?.revertReason || '';
     const traceOutput = debugTraceResult?.output || '';
-
-    const isOutOfGas =
-      (gasLimit > 0n && gasRatio >= 98.5) ||
-      traceError.toLowerCase().includes('out of gas') ||
-      (callReplayResult && !callReplayResult.ok && callReplayResult.message.toLowerCase().includes('out of gas'));
 
     // Extract any revert hex from trace or eth_call replay
     let revertHex = null;
@@ -641,44 +433,33 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
       }
     }
 
-    const decodedRevert = revertHex ? decodeHexRevertString(revertHex) : null;
-    const combinedErrorText = `${traceError} ${traceRevertReason} ${callReplayResult?.message || ''} ${
-      decodedRevert?.rawReason || ''
-    }`.toLowerCase();
-
-    if (isOutOfGas) {
+    const decodedRevert = revertHex ? decodeRevertData(revertHex) : null;
+    const failureCategory = classifyFailureEvidence({ decodedRevert, traceError, traceRevertReason, replayError: callReplayResult?.message });
+    if (failureCategory === 'Out of Gas') {
       diagnosis = {
         isFailed: true,
         category: 'Out of Gas',
         failureCode: 'OUT_OF_GAS',
-        technicalReason: `Transaction consumed ${gasUsed.toString()} of ${gasLimit.toString()} gas limit (${gasRatio.toFixed(
-          2
-        )}%), exhausting allocated computation fuel before completion.`,
+        technicalReason: gasRatio === null ? 'RPC trace or simulation reported out of gas; receipt gas metrics are unavailable.' : `RPC trace or simulation reported out of gas after ${gasUsed.toString()} of ${gasLimit.toString()} gas (${gasRatio.toFixed(2)}%).`,
         plainExplanation:
-          'Your transaction ran out of fuel ("gas") before it could finish the job. Every step a smart contract takes requires a tiny bit of gas, and the maximum gas limit set by your wallet was too low for the complexity of this action.',
+          'The RPC trace or replay reports an out-of-gas condition. A replay is diagnostic evidence and can differ from the original mined execution state.',
         suggestedFixes: [
-          `Increase the Gas Limit in your wallet settings by 30%–50% (try at least ${((gasLimit * 15n) / 10n).toString()} gas) before retrying.`,
+          gasLimit > 0n ? `Consider increasing the gas limit above ${gasLimit.toString()} and inspect the next simulation before retrying.` : 'Review the wallet gas estimate before retrying.',
           'Avoid manually lowering the gas limit suggested by your wallet.',
           'Retry when the contract state is less congested so fewer storage hops occur.'
         ],
         revertHex
       };
-    } else if (
-      decodedRevert?.category === 'Insufficient Allowance' ||
-      combinedErrorText.includes('allowance') ||
-      combinedErrorText.includes('approve') ||
-      combinedErrorText.includes('erc20insufficientallowance') ||
-      methodSelector === '0x23b872dd' // transferFrom
-    ) {
+    } else if (failureCategory === 'Insufficient Allowance') {
       diagnosis = {
         isFailed: true,
         category: 'Insufficient Allowance',
         failureCode: 'INSUFFICIENT_ALLOWANCE',
         technicalReason:
-          decodedRevert?.rawReason ||
+          decodedRevert?.reason ||
           'The target smart contract attempted to pull ERC-20 tokens via transferFrom(), but the spender allowance was lower than the requested amount.',
         plainExplanation:
-          'The app tried to move tokens from your wallet on your behalf, but it didn’t have permission for that full amount yet. On blockchains like Pharos, you have to "Approve" a spending limit before a DApp can swap or deposit your tokens.',
+          'The available revert evidence suggests a token allowance check failed. If this came from a replay, confirm it against the mined trace and current contract state before approving more tokens.',
         suggestedFixes: [
           'Click the "Approve" button in the DApp first and wait for that approval transaction to finish.',
           'Make sure the approved spending cap is at least equal to the amount of tokens you are trying to use.',
@@ -686,24 +467,14 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
         ],
         revertHex
       };
-    } else if (
-      decodedRevert?.category === 'Insufficient Balance' ||
-      combinedErrorText.includes('insufficient balance') ||
-      combinedErrorText.includes('transfer amount exceeds balance') ||
-      combinedErrorText.includes('erc20insufficientbalance') ||
-      senderBalanceWei < valueWei + feeWei
-    ) {
+    } else if (failureCategory === 'Insufficient Balance') {
       diagnosis = {
         isFailed: true,
         category: 'Insufficient Balance',
         failureCode: 'INSUFFICIENT_BALANCE',
-        technicalReason:
-          decodedRevert?.rawReason ||
-          `Wallet balance (${formatUnits(senderBalanceHex, 18, 4)} ${
-            foundNetwork.symbol
-          }) or token balance was insufficient to cover the transfer value plus network fee.`,
+        technicalReason: decodedRevert?.reason || 'RPC error or decoded revert data suggests a balance check failed. No historical token balance proof is available.',
         plainExplanation:
-          'Your wallet did not have enough tokens (or native PHRS/PROS for fees) at the exact moment this transaction was processed. Even if your balance looked close, you need enough to cover both the amount you are sending and a tiny network fee.',
+          'The available revert evidence suggests a contract balance check failed. It may refer to a token balance; this does not by itself establish that your native balance or gas funds were too low.',
         suggestedFixes: [
           `Lower the amount you are sending or swapping slightly so you keep extra ${foundNetwork.symbol} for gas fees.`,
           'Check your token balance in your wallet to confirm another pending transaction didn’t spend those funds first.',
@@ -714,7 +485,7 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
     } else {
       const cleanReason =
         traceRevertReason ||
-        decodedRevert?.rawReason ||
+        decodedRevert?.reason ||
         (callReplayResult && !callReplayResult.ok ? callReplayResult.message : null) ||
         `Smart contract at ${tx?.to?.slice(0, 10)}... rejected execution at selector ${methodSelector}`;
 
@@ -722,9 +493,9 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
         isFailed: true,
         category: 'Revert Reason',
         failureCode: decodedRevert?.signature || 'CONTRACT_REVERT',
-        technicalReason: cleanReason,
+        technicalReason: `${cleanReason} (eth_call/debug trace is diagnostic simulation evidence; receipt status is the mined outcome.)`,
         plainExplanation:
-          'The smart contract canceled this transaction on purpose to protect your funds because one of its safety rules wasn’t met. This commonly happens when a token price moves too fast during a swap (slippage), a time limit expires, or an item was already claimed.',
+          'The receipt confirms execution failed. The trace or replay provides a diagnostic clue, but the exact cause may depend on contract state and is not always recoverable from an RPC response.',
         suggestedFixes: [
           'Refresh the DApp page so it fetches the newest live prices and contract state.',
           'If you are swapping tokens on a DEX, increase your Slippage Tolerance slightly (for example, from 0.5% to 1.5%).',
@@ -739,18 +510,18 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
     hash: cleanHash,
     network: foundNetwork,
     mcpProbe,
-    status: isSuccess ? 'PASSED' : 'FAILED',
-    statusHex: statusHex || '0x0',
+    status,
+    statusHex: statusHex || null,
     blockNumber: receipt?.blockNumber ? Number(hexToBigInt(receipt.blockNumber)) : null,
     timestamp: blockData?.timestamp ? Number(hexToBigInt(blockData.timestamp)) * 1000 : null,
     from: tx?.from || receipt?.from || 'Unknown',
     to: tx?.to || receipt?.to || 'Contract Creation',
-    valueFormatted: `${formatUnits(tx?.value || '0x0', 18, 6)} ${foundNetwork.symbol}`,
-    feeFormatted: `${formatUnits('0x' + feeWei.toString(16), 18, 6)} ${foundNetwork.symbol}`,
-    gasLimit: gasLimit.toString(),
-    gasUsed: gasUsed.toString(),
-    gasRatio: gasRatio.toFixed(1),
-    senderBalanceFormatted: `${formatUnits(senderBalanceHex, 18, 4)} ${foundNetwork.symbol}`,
+    valueFormatted: tx?.value ? `${formatUnits(tx.value, 18, 6)} ${foundNetwork.symbol}` : 'Unavailable',
+    feeFormatted: feeWei === null ? 'Unavailable' : `${formatUnits('0x' + feeWei.toString(16), 18, 6)} ${foundNetwork.symbol}`,
+    gasLimit: metrics.gasLimit === null ? 'Unavailable' : gasLimit.toString(),
+    gasUsed: metrics.gasUsed === null ? 'Unavailable' : gasUsed.toString(),
+    gasRatio: gasRatio === null ? null : gasRatio.toFixed(1),
+    senderBalanceFormatted: senderBalanceHex === null ? 'Unavailable' : `${formatUnits(senderBalanceHex, 18, 4)} ${foundNetwork.symbol}`,
     methodSelector,
     inputData,
     isContractInteraction,
@@ -762,64 +533,19 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
 }
 
 async function generateAiSupportExplanation(txReport) {
-  const apiKey = '';
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
-
-  const systemPrompt =
-    'You are the friendly Pharos Network DApp Support Agent (an intelligent octopus mascot). Explain why this real Pharos blockchain transaction failed or succeeded in clear, everyday plain English with zero confusing crypto jargon. Return JSON matching the schema.';
-
-  const userQuery = `Analyze this live Pharos Network transaction:
-- Network: ${txReport.network.name} (Chain ID ${txReport.network.chainId})
-- Transaction Hash: ${txReport.hash}
-- Status: ${txReport.status} (${txReport.statusHex})
-- Category Detected: ${txReport.diagnosis.category}
-- Technical Cause: ${txReport.diagnosis.technicalReason}
-- From: ${txReport.from} (Current Balance: ${txReport.senderBalanceFormatted})
-- To: ${txReport.to}
-- Value Sent: ${txReport.valueFormatted}
-- Gas Used: ${txReport.gasUsed} / ${txReport.gasLimit} (${txReport.gasRatio}%)
-- Function Selector: ${txReport.methodSelector}`;
-
-  const payload = {
-    contents: [{ role: 'user', parts: [{ text: userQuery }] }],
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        properties: {
-          headline: { type: 'STRING' },
-          plainEnglishWhy: { type: 'STRING' },
-          stepByStepFixes: {
-            type: 'ARRAY',
-            items: { type: 'STRING' }
-          }
-        },
-        propertyOrdering: ['headline', 'plainEnglishWhy', 'stepByStepFixes']
-      }
-    }
+  const report = {
+    hash: txReport.hash, status: txReport.status, statusHex: txReport.statusHex,
+    network: { name: txReport.network.name, chainId: txReport.network.chainId },
+    diagnosis: { category: txReport.diagnosis.category, technicalReason: txReport.diagnosis.technicalReason },
+    valueFormatted: txReport.valueFormatted, gasUsed: txReport.gasUsed, gasLimit: txReport.gasLimit,
+    methodSelector: txReport.methodSelector
   };
-
-  let delay = 1000;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) return JSON.parse(text);
-      }
-    } catch {
-      // Retry with exponential backoff
-    }
-    await new Promise((r) => setTimeout(r, delay));
-    delay *= 2;
-  }
-  return null;
+  const res = await fetch('/api/explain', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15000), body: JSON.stringify({ report }) });
+  if (!res.ok) throw new Error(`AI explanation service returned HTTP ${res.status}.`);
+  const data = await res.json();
+  const explanation = data?.explanation;
+  if (typeof explanation?.plainEnglishWhy !== 'string' || !Array.isArray(explanation?.stepByStepFixes)) throw new Error('AI explanation service returned an invalid response.');
+  return explanation;
 }
 
 export default function App() {
@@ -829,6 +555,7 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState(null);
   const [activeReport, setActiveReport] = useState(null);
   const [aiEnhanced, setAiEnhanced] = useState(null);
+  const [aiError, setAiError] = useState(null);
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [copiedText, setCopiedText] = useState(null);
   const [showRawModal, setShowRawModal] = useState(false);
@@ -838,9 +565,7 @@ export default function App() {
     blockNumber: null,
     gasPriceGwei: null,
     chainIdHex: null,
-    mcpReachable: true,
-    latencyMs: null,
-    isSyncing: false
+    latencyMs: null
   });
 
   // Live Discovered Transactions from Pharos RPC blocks
@@ -850,9 +575,12 @@ export default function App() {
 
   // Live Diagnostic Simulation Sandbox (Executes real eth_call / eth_estimateGas against Pharos RPC for the 4 failure types)
   const [sandboxLoadingType, setSandboxLoadingType] = useState(null);
-  const [verifiedFailureDemos, setVerifiedFailureDemos] = useState({});
+  const [failureEvidenceRecords, setFailureEvidenceRecords] = useState({});
+  const scanInFlight = useRef(false);
 
   const initialAutoInspectDone = useRef(false);
+  const inspectionSequence = useRef(0);
+  const aiErrorSequence = useRef(0);
 
   const currentNet = PHAROS_NETWORKS[selectedNetwork];
 
@@ -865,13 +593,16 @@ export default function App() {
   const inspectTransaction = useCallback(
     async (hashToInspect, netKey = selectedNetwork) => {
       if (!hashToInspect) return;
+      const sequence = ++inspectionSequence.current;
       setTxInput(hashToInspect);
       setIsAnalyzing(true);
       setErrorMessage(null);
       setAiEnhanced(null);
+      setAiError(null);
 
       try {
         const report = await analyzeLivePharosTransaction(hashToInspect, netKey);
+        if (sequence !== inspectionSequence.current) return;
         setActiveReport(report);
         if (report.network.id !== selectedNetwork) {
           setSelectedNetwork(report.network.id);
@@ -879,7 +610,7 @@ export default function App() {
 
         // Record in discovered list if not already present and if it failed, mark its failure type as demonstrated
         if (report.diagnosis.isFailed) {
-          setVerifiedFailureDemos((prev) => ({
+          setFailureEvidenceRecords((prev) => ({
             ...prev,
             [report.diagnosis.category]: {
               source: `Tx ${report.hash.slice(0, 10)}...`,
@@ -891,15 +622,24 @@ export default function App() {
 
         // Trigger Gemini plain-language refinement in background
         setIsAiLoading(true);
+        const aiSequence = ++aiErrorSequence.current;
         generateAiSupportExplanation(report)
           .then((res) => {
-            if (res) setAiEnhanced(res);
+            if (res && sequence === inspectionSequence.current && aiSequence === aiErrorSequence.current) setAiEnhanced(res);
           })
-          .finally(() => setIsAiLoading(false));
+          .catch((error) => {
+            if (sequence === inspectionSequence.current && aiSequence === aiErrorSequence.current) {
+              setAiEnhanced(null);
+              setAiError(`${error.message} Rule-based explanation remains available.`);
+            }
+          })
+          .finally(() => {
+            if (sequence === inspectionSequence.current && aiSequence === aiErrorSequence.current) setIsAiLoading(false);
+          });
       } catch (err) {
-        setErrorMessage(err.message || 'Could not retrieve transaction from Pharos RPC.');
+        if (sequence === inspectionSequence.current) setErrorMessage(err.message || 'Could not retrieve transaction from Pharos RPC.');
       } finally {
-        setIsAnalyzing(false);
+        if (sequence === inspectionSequence.current) setIsAnalyzing(false);
       }
     },
     [selectedNetwork]
@@ -907,18 +647,21 @@ export default function App() {
 
   const scanRecentPharosBlocks = useCallback(
     async (netKey = selectedNetwork, autoSelectFirst = false) => {
+      if (scanInFlight.current) return;
       const net = PHAROS_NETWORKS[netKey];
+      scanInFlight.current = true;
       setIsScanningChain(true);
-      const startPerf = performance.now();
+    const startPerf = monotonicNow();
 
       try {
         const [blockHex, gasPriceHex, chainIdHex] = await Promise.all([
-          callPharosRpc(net.rpcUrl, 'eth_blockNumber', []),
-          callPharosRpc(net.rpcUrl, 'eth_gasPrice', []).catch(() => '0x3b9aca00'),
-          callPharosRpc(net.rpcUrl, 'eth_chainId', [])
+          callJsonRpc(net.rpcUrl, 'eth_blockNumber', []),
+          callJsonRpc(net.rpcUrl, 'eth_gasPrice', []),
+          callJsonRpc(net.rpcUrl, 'eth_chainId', [])
         ]);
 
-        const latency = Math.round(performance.now() - startPerf);
+        const latency = Math.round(monotonicNow() - startPerf);
+        if (parseHexQuantity(chainIdHex, 'chain ID') !== BigInt(net.chainId)) throw new Error(`RPC chain ID mismatch for ${net.name}.`);
         const latestBlock = Number(hexToBigInt(blockHex));
         const gasGwei = formatUnits(gasPriceHex, 9, 2);
 
@@ -926,9 +669,7 @@ export default function App() {
           blockNumber: latestBlock,
           gasPriceGwei: gasGwei,
           chainIdHex,
-          mcpReachable: true,
-          latencyMs: latency,
-          isSyncing: false
+          latencyMs: latency
         });
 
         // Scan backwards across recent blocks to gather real live transactions and check their receipts
@@ -937,10 +678,8 @@ export default function App() {
           blockNumbersToScan.push('0x' + (latestBlock - i).toString(16));
         }
 
-        const blocks = await Promise.all(
-          blockNumbersToScan.map((bHex) =>
-            callPharosRpc(net.rpcUrl, 'eth_getBlockByNumber', [bHex, true]).catch(() => null)
-          )
+        const blocks = await mapWithConcurrency(blockNumbersToScan, MAX_RPC_CONCURRENCY, (bHex) =>
+          callJsonRpc(net.rpcUrl, 'eth_getBlockByNumber', [bHex, true]).catch(() => null)
         );
 
         setBlocksScannedCount((prev) => prev + blocks.filter(Boolean).length);
@@ -965,27 +704,27 @@ export default function App() {
         }
 
         // Fetch receipts in parallel for candidate transactions to find real failed (0x0) and passed (0x1) txs
-        const receipts = await Promise.all(
-          candidateTxs.map((t) =>
-            callPharosRpc(net.rpcUrl, 'eth_getTransactionReceipt', [t.hash]).catch(() => null)
-          )
+        const receipts = await mapWithConcurrency(candidateTxs, MAX_RPC_CONCURRENCY, (t) =>
+          callJsonRpc(net.rpcUrl, 'eth_getTransactionReceipt', [t.hash]).catch(() => null)
         );
 
         const enriched = [];
         for (let i = 0; i < candidateTxs.length; i++) {
           const r = receipts[i];
           if (!r) continue;
-          const isFailed = r.status === '0x0';
+          const receiptStatus = classifyReceiptStatus(r);
+          if (receiptStatus !== 'FAILED' && receiptStatus !== 'PASSED') continue;
+          const isFailed = receiptStatus === 'FAILED';
           const gasLimit = hexToBigInt(candidateTxs[i].gas);
           const gasUsed = hexToBigInt(r.gasUsed);
           const ratio = gasLimit > 0n ? Number((gasUsed * 100n) / gasLimit) : 0;
 
           let quickTag = isFailed ? 'Contract Revert' : 'Confirmed';
-          if (isFailed && ratio >= 98) quickTag = 'Out of Gas';
+          if (isFailed && ratio >= 98) quickTag = 'High gas use (cause unverified)';
           else if (isFailed && (candidateTxs[i].input || '').startsWith('0x23b872dd'))
-            quickTag = 'Allowance / TransferFrom';
+            quickTag = 'transferFrom selector (cause unverified)';
           else if (isFailed && (candidateTxs[i].input || '').startsWith('0xa9059cbb'))
-            quickTag = 'Token Balance / Transfer';
+            quickTag = 'transfer selector (cause unverified)';
 
           enriched.push({
             ...candidateTxs[i],
@@ -1012,27 +751,29 @@ export default function App() {
           inspectTransaction(enriched[0].hash, net.id);
         }
       } catch (err) {
-        setChainTelemetry((prev) => ({ ...prev, isSyncing: false }));
+          setErrorMessage(`Recent block scan failed: ${err.message}`);
+          setChainTelemetry((prev) => ({ ...prev, latencyMs: null }));
       } finally {
+        scanInFlight.current = false;
         setIsScanningChain(false);
       }
     },
-    [selectedNetwork, inspectTransaction]
+        [selectedNetwork, inspectTransaction]
   );
 
   const executeLiveRpcFailureProbe = async (failureType) => {
     setSandboxLoadingType(failureType);
     setErrorMessage(null);
-    const net = PHAROS_NETWORKS.atlantic; // Uses official Pharos Atlantic Testnet live contracts
+    const net = PHAROS_NETWORKS.atlantic;
 
-    // Official Atlantic Testnet WPHRS / USDC contracts from docs.pharos.xyz/getting-started/token-registry
+    // Existing probe addresses from the original app; deployment provenance has not been independently verified.
     const WPHRS_CONTRACT = '0x838800b758277CC111B2d48Ab01e5E164f8E9471';
     const USDC_CONTRACT = '0xcfC8330f4BCAB529c625D12781b1C19466A9Fc8B';
     const ZERO_WALLET = '0x000000000000000000000000000000000000dEaD';
     const SPENDER_WALLET = '0x000000000000000000000000000000000000BEEF';
 
     try {
-      const latestBlockHex = await callPharosRpc(net.rpcUrl, 'eth_blockNumber', []);
+      const latestBlockHex = await callJsonRpc(net.rpcUrl, 'eth_blockNumber', []);
       const latestBlockNum = Number(hexToBigInt(latestBlockHex));
 
       let callParams = null;
@@ -1051,7 +792,7 @@ export default function App() {
             data: '0xa9059cbb000000000000000000000000000000000000000000000000000000000000beef0000000000000000000000000000000000000000000000000000000000000001'
           }
         ];
-        probeDescription = 'eth_call to Atlantic WPHRS (0x8388...9471) with 21,005 gas limit';
+        probeDescription = 'eth_estimateGas against the configured Atlantic probe address with a 21,005 gas cap';
       } else if (failureType === 'Insufficient Allowance') {
         // Call ERC20 transferFrom(address,address,uint256) on live Pharos USDC without prior approve()
         callParams = [
@@ -1066,7 +807,7 @@ export default function App() {
           },
           'latest'
         ];
-        probeDescription = 'eth_call transferFrom() on live Pharos Atlantic USDC (0xcfC8...Fc8B) with 0 allowance';
+        probeDescription = 'eth_call transferFrom() against the configured Atlantic probe address';
       } else if (failureType === 'Insufficient Balance') {
         // Call ERC20 transfer(address,uint256) on live Pharos WPHRS for 999,999,999 tokens from an empty address
         callParams = [
@@ -1080,7 +821,7 @@ export default function App() {
           },
           'latest'
         ];
-        probeDescription = 'eth_call transfer() on live Pharos Atlantic WPHRS (0x8388...9471) exceeding sender balance';
+        probeDescription = 'eth_call transfer() against the configured Atlantic probe address';
       } else {
         // Explicit Smart Contract Revert Reason on live Pharos contract (invalid function selector / withdraw overflow)
         callParams = [
@@ -1093,24 +834,18 @@ export default function App() {
           },
           'latest'
         ];
-        probeDescription = 'eth_call withdraw(MAX_UINT256) on live Pharos WPHRS contract triggering explicit revert';
+        probeDescription = 'eth_call withdraw(MAX_UINT256) against the configured Atlantic probe address';
       }
 
       let liveRpcError = null;
+      const probeStartedAt = monotonicNow();
       try {
-        if (failureType === 'Out of Gas') {
-          await callPharosRpc(net.rpcUrl, 'eth_call', [callParams[0], 'latest']);
-        } else {
-          await callPharosRpc(net.rpcUrl, rpcMethod, callParams);
-        }
+        await callJsonRpc(net.rpcUrl, rpcMethod, callParams);
       } catch (rpcErr) {
         liveRpcError = rpcErr;
       }
-
-      const rawErrorMsg =
-        liveRpcError?.message ||
-        liveRpcError?.data ||
-        `Live RPC execution reverted on block #${latestBlockNum}`;
+      if (!liveRpcError) throw new Error('The RPC accepted this simulation; no failure was demonstrated.');
+      const rawErrorMsg = liveRpcError.message || 'RPC returned an error without a message.';
 
       const revertHex =
         typeof liveRpcError?.data === 'string' && liveRpcError.data.startsWith('0x')
@@ -1123,7 +858,7 @@ export default function App() {
           isFailed: true,
           category: 'Out of Gas',
           failureCode: 'OUT_OF_GAS_RPC_21005',
-          technicalReason: `Live Pharos RPC Response (Block #${latestBlockNum}): "${rawErrorMsg}" — Provided 21,005 gas limit was exhausted during EVM SLOAD/SSTORE opcodes.`,
+          technicalReason: `eth_estimateGas simulation on block #${latestBlockNum} returned: "${rawErrorMsg}". This does not prove a mined transaction ran out of gas.`,
           plainExplanation:
             'Your transaction ran out of fuel ("gas") mid-way through execution on Pharos. Because smart contract calls require more computation than a simple transfer, the 21,005 gas cap ran dry before the contract could finish.',
           suggestedFixes: [
@@ -1137,7 +872,7 @@ export default function App() {
           isFailed: true,
           category: 'Insufficient Allowance',
           failureCode: 'ERC20_INSUFFICIENT_ALLOWANCE',
-          technicalReason: `Live Pharos RPC Response on USDC (${USDC_CONTRACT.slice(0, 10)}... at Block #${latestBlockNum}): "${rawErrorMsg}"`,
+          technicalReason: `eth_call simulation against configured token address ${USDC_CONTRACT} at block #${latestBlockNum} returned: "${rawErrorMsg}". This is simulation evidence, not a mined transaction.`,
           plainExplanation:
             'The smart contract tried to move USDC from your wallet using transferFrom(), but you haven’t given it permission ("allowance") to spend that amount yet. Your tokens are safe, and the contract stopped automatically.',
           suggestedFixes: [
@@ -1151,7 +886,7 @@ export default function App() {
           isFailed: true,
           category: 'Insufficient Balance',
           failureCode: 'ERC20_INSUFFICIENT_BALANCE',
-          technicalReason: `Live Pharos RPC Response on WPHRS (${WPHRS_CONTRACT.slice(0, 10)}... at Block #${latestBlockNum}): "${rawErrorMsg}"`,
+          technicalReason: `eth_call simulation against configured token address ${WPHRS_CONTRACT} at block #${latestBlockNum} returned: "${rawErrorMsg}". This does not independently prove the failure category.`,
           plainExplanation:
             'Your wallet doesn’t have enough WPHRS tokens (or native PHRS for gas) to complete this transfer. The Pharos node checked your real-time balance at Block #' +
             latestBlockNum +
@@ -1167,7 +902,7 @@ export default function App() {
           isFailed: true,
           category: 'Revert Reason',
           failureCode: 'CONTRACT_EXECUTION_REVERTED',
-          technicalReason: `Live Pharos RPC Response on WPHRS (${WPHRS_CONTRACT.slice(0, 10)}... at Block #${latestBlockNum}): "${rawErrorMsg}"`,
+          technicalReason: `eth_call simulation against configured token address ${WPHRS_CONTRACT} at block #${latestBlockNum} returned: "${rawErrorMsg}". This is not a mined transaction receipt.`,
           plainExplanation:
             'The smart contract hit a built-in safety check (require / revert) and canceled the transaction. Here, the contract blocked an invalid withdrawal request that violated the contract’s internal accounting rules.',
           suggestedFixes: [
@@ -1179,51 +914,54 @@ export default function App() {
         }
       };
 
-      const selectedDiag = diagnosesByType[failureType];
+      const observedCategory = classifyFailureEvidence({ decodedRevert: revertHex ? decodeRevertData(revertHex) : null, replayError: rawErrorMsg });
+      const selectedDiag = observedCategory === failureType ? diagnosesByType[failureType] : {
+        isFailed: false,
+        category: 'Simulation error (unclassified)',
+        failureCode: 'SIMULATION_ERROR_UNCLASSIFIED',
+        technicalReason: `Requested demonstration: ${failureType}. RPC returned: ${rawErrorMsg}. The response does not confirm the requested cause.`,
+        plainExplanation: 'The RPC rejected this simulation, but its response does not identify the specific failure type this demo was intended to show. No transaction was mined.',
+        suggestedFixes: ['Inspect the raw simulation response.', 'Treat the category as unconfirmed until a mined receipt or explicit revert evidence supports it.'],
+        revertHex
+      };
 
       const liveProbeReport = {
-        hash: `Live RPC Call @ Block #${latestBlockNum} (${failureType})`,
+        hash: `Simulation @ Block #${latestBlockNum} (${failureType})`,
         isLiveRpcProbe: true,
         network: net,
         mcpProbe: {
-          transport: 'Pharos Chain MCP + Direct JSON-RPC Execution',
-          mcpStatus: `Verified Live on Block #${latestBlockNum}`,
-          latencyMs: chainTelemetry.latencyMs || 42
+          transport: `Direct JSON-RPC ${rpcMethod}`,
+          mcpStatus: 'Simulation error returned; no transaction was mined',
+          latencyMs: Math.round(monotonicNow() - probeStartedAt)
         },
-        status: 'FAILED',
-        statusHex: '0x0',
+        status: 'SIMULATED',
+        statusHex: null,
         blockNumber: latestBlockNum,
-        timestamp: Date.now(),
+        timestamp: null,
         from: callParams[0].from,
         to: callParams[0].to,
         valueFormatted: `0 ${net.symbol}`,
-        feeFormatted: `0.000021 ${net.symbol}`,
-        gasLimit: failureType === 'Out of Gas' ? '21005' : '120000',
-        gasUsed: failureType === 'Out of Gas' ? '21005' : '44820',
-        gasRatio: failureType === 'Out of Gas' ? '100.0' : '37.4',
-        senderBalanceFormatted: `0 ${net.symbol}`,
+        feeFormatted: 'Unavailable (simulation)',
+        gasLimit: callParams[0].gas ? String(parseHexQuantity(callParams[0].gas)) : 'Unavailable',
+        gasUsed: 'Unavailable (simulation)',
+        gasRatio: null,
+        senderBalanceFormatted: 'Not queried',
         methodSelector: callParams[0].data.slice(0, 10),
         inputData: callParams[0].data,
         isContractInteraction: true,
         diagnosis: selectedDiag,
         rawTx: callParams[0],
-        rawReceipt: {
-          status: '0x0',
-          blockNumber: latestBlockHex,
-          rpcErrorReturned: rawErrorMsg,
-          probeDescription
-        }
+        rawReceipt: null,
+        rawSimulation: { method: rpcMethod, params: callParams, error: { message: rawErrorMsg, data: liveRpcError.data ?? null }, description: probeDescription }
       };
 
       setActiveReport(liveProbeReport);
-      setVerifiedFailureDemos((prev) => ({
-        ...prev,
-        [failureType]: {
-          source: `Block #${latestBlockNum} RPC`,
-          timestamp: new Date().toLocaleTimeString(),
-          reason: rawErrorMsg
-        }
-      }));
+      if (observedCategory === failureType) {
+        setFailureEvidenceRecords((prev) => ({
+          ...prev,
+          [failureType]: { source: `Simulation at block #${latestBlockNum}`, timestamp: new Date().toLocaleTimeString(), reason: rawErrorMsg }
+        }));
+      }
     } catch (err) {
       setErrorMessage(`Live RPC probe failed: ${err.message}`);
     } finally {
@@ -1232,20 +970,20 @@ export default function App() {
   };
 
   useEffect(() => {
-    scanRecentPharosBlocks(selectedNetwork, true);
+    const initialScan = setTimeout(() => scanRecentPharosBlocks(selectedNetwork, true), 0);
     const interval = setInterval(() => {
       scanRecentPharosBlocks(selectedNetwork, false);
     }, 15000);
-    return () => clearInterval(interval);
+    return () => { clearTimeout(initialScan); clearInterval(interval); };
   }, [selectedNetwork, scanRecentPharosBlocks]);
 
-  const verifiedCount = Object.keys(verifiedFailureDemos).length;
+  const evidenceCategoryCount = Object.keys(failureEvidenceRecords).length;
   const mascotMood = isAnalyzing || sandboxLoadingType
     ? 'scanning'
     : activeReport
     ? activeReport.status === 'FAILED'
       ? 'failed'
-      : 'passed'
+        : activeReport.status === 'PASSED' ? 'passed' : 'idle'
     : 'idle';
 
   return (
@@ -1456,9 +1194,7 @@ export default function App() {
               <div className="px-2.5 py-1.5 rounded-xl bg-slate-50 border border-slate-200/80 flex items-center gap-1.5">
                 <span className="font-mono font-extrabold text-blue-600">04</span>
                 <span className="text-slate-800 font-semibold truncate">
-                  {verifiedCount >= 3
-                    ? `${verifiedCount}/4 Failures Verified!`
-                    : `3+ Failures (${verifiedCount}/4)`}
+                  {evidenceCategoryCount}/4 categories with evidence
                 </span>
               </div>
             </div>
@@ -1475,14 +1211,14 @@ export default function App() {
               <div className="flex items-center justify-between">
                 <div>
                   <span className="text-[10px] font-extrabold uppercase tracking-wider text-blue-600 block">
-                    Requirement #04 Live Verifier
+                    RPC Simulation Demos
                   </span>
                   <h3 className="text-sm font-extrabold text-slate-900">
-                    4 Failure Types on Live RPC
+                    4 Diagnostic Simulations
                   </h3>
                 </div>
                 <span className="text-xs font-mono font-extrabold px-2 py-0.5 rounded-lg bg-slate-100 text-slate-800 border border-slate-200">
-                  {verifiedCount}/4 Tested
+                  {evidenceCategoryCount}/4 Categories Seen
                 </span>
               </div>
 
@@ -1490,31 +1226,31 @@ export default function App() {
                 {[
                   {
                     type: 'Out of Gas',
-                    subtitle: '21,005 gas cap on live WPHRS',
+                    subtitle: 'Low gas estimate simulation',
                     icon: Fuel,
                     color: 'text-amber-700 bg-amber-50 border-amber-200'
                   },
                   {
                     type: 'Insufficient Allowance',
-                    subtitle: 'Unapproved transferFrom() USDC',
+                    subtitle: 'transferFrom simulation (configured address)',
                     icon: ShieldAlert,
                     color: 'text-rose-700 bg-rose-50 border-rose-200'
                   },
                   {
                     type: 'Insufficient Balance',
-                    subtitle: 'Exceeding balance on WPHRS',
+                    subtitle: 'transfer simulation (configured address)',
                     icon: Wallet,
                     color: 'text-purple-700 bg-purple-50 border-purple-200'
                   },
                   {
                     type: 'Revert Reason',
-                    subtitle: 'withdraw(MAX_UINT) revert',
+                    subtitle: 'withdraw(MAX_UINT) simulation',
                     icon: Code2,
                     color: 'text-blue-700 bg-blue-50 border-blue-200'
                   }
                 ].map((item) => {
                   const IconComp = item.icon;
-                  const isTested = Boolean(verifiedFailureDemos[item.type]);
+                  const isTested = Boolean(failureEvidenceRecords[item.type]);
                   const isLoadingThis = sandboxLoadingType === item.type;
                   const isCurrent = activeReport?.diagnosis?.category === item.type;
 
@@ -1662,14 +1398,14 @@ export default function App() {
                   ) : activeReport.status === 'FAILED' ? (
                     <>
                       <XCircle className="w-4 h-4" />
-                      <span>Oops! Transaction Failed (Status 0x0)</span>
+                      <span>Mined transaction failed (Status 0x0)</span>
                     </>
-                  ) : (
+                  ) : activeReport.status === 'PASSED' ? (
                     <>
                       <CheckCircle2 className="w-4 h-4" />
-                      <span>Yay! Transaction Passed (Status 0x1)</span>
+                      <span>Mined transaction passed (Status 0x1)</span>
                     </>
-                  )}
+                  ) : <><Info className="w-4 h-4" /><span>{activeReport.isLiveRpcProbe ? 'Simulation result (not mined)' : 'Pending / receipt unavailable'}</span></>}
                 </span>
 
                 {activeReport && (
@@ -1680,7 +1416,7 @@ export default function App() {
                         : 'bg-emerald-50 text-emerald-800 border-emerald-200'
                     }`}
                   >
-                    {activeReport.diagnosis.failureCode}
+                    {activeReport.statusHex || activeReport.diagnosis.failureCode}
                   </span>
                 )}
               </div>
@@ -1698,7 +1434,7 @@ export default function App() {
                 <div className="sm:col-span-4 flex justify-center">
                   <PharosOctopusMascot
                     mood={mascotMood}
-                    failureCategory={activeReport?.diagnosis?.category}
+                    failureCategory={activeReport?.status === 'FAILED' || activeReport?.status === 'PASSED' ? activeReport.diagnosis.category : null}
                   />
                 </div>
 
@@ -1719,12 +1455,13 @@ export default function App() {
                     ) : (
                       <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                     )}
-                    <span>Octopus Support Diagnosis</span>
+                    <span>{activeReport?.isLiveRpcProbe ? 'Simulation Diagnosis' : 'Octopus Support Diagnosis'}</span>
                     {isAiLoading && (
                       <span className="text-[11px] text-slate-600 font-semibold animate-pulse">
                         • AI Refining...
                       </span>
                     )}
+                    {aiError && <span className="text-[11px] text-amber-700 font-semibold">AI unavailable; showing rule-based analysis.</span>}
                   </div>
 
                   <h2
@@ -1739,8 +1476,12 @@ export default function App() {
                     {!activeReport
                       ? 'Ready to Inspect Any Pharos Transaction'
                       : activeReport.status === 'FAILED'
-                      ? `Oops! It failed due to ${activeReport.diagnosis.category}`
-                      : 'Yay! Your transaction succeeded on Pharos!'}
+                      ? `Mined transaction failed: ${activeReport.diagnosis.category}`
+                      : activeReport.status === 'PASSED'
+                      ? 'Your transaction succeeded on Pharos.'
+                      : activeReport.isLiveRpcProbe
+                      ? `Simulation result: ${activeReport.diagnosis.category}`
+                      : 'Transaction pending or receipt unavailable'}
                   </h2>
 
                   <p
@@ -1806,7 +1547,7 @@ export default function App() {
                       onClick={() => setShowRawModal(true)}
                       className="text-cyan-300 hover:underline font-sans font-bold cursor-pointer"
                     >
-                      Full JSON Receipt →
+                      Full Evidence JSON →
                     </button>
                   </div>
                   <div className="text-white font-medium break-all line-clamp-2 leading-snug">
@@ -1851,15 +1592,15 @@ export default function App() {
                       <Cpu className="w-4 h-4 text-blue-600 flex-shrink-0" />
                       <div className="truncate">
                         <div className="font-extrabold text-slate-900 truncate">
-                          {activeReport.mcpProbe.transport}
+                          Transaction evidence: Direct JSON-RPC
                         </div>
                         <div className="text-[11px] font-semibold text-slate-600">
-                          {activeReport.network.name} • {activeReport.mcpProbe.mcpStatus}
+                          MCP probe: {activeReport.mcpProbe.transport} • {activeReport.mcpProbe.mcpStatus}
                         </div>
                       </div>
                     </div>
                     <span className="font-mono text-xs font-extrabold text-blue-700 bg-white px-2 py-0.5 rounded-lg border border-blue-200 flex-shrink-0">
-                      {activeReport.mcpProbe.latencyMs}ms
+                      {activeReport.mcpProbe.latencyMs === null ? '—' : `${activeReport.mcpProbe.latencyMs}ms`}
                     </span>
                   </div>
 
@@ -1871,8 +1612,8 @@ export default function App() {
                         <span>Gas Execution Ratio</span>
                       </span>
                       <span className="font-mono font-extrabold text-slate-900">
-                        {Number(activeReport.gasUsed).toLocaleString()} /{' '}
-                        {Number(activeReport.gasLimit).toLocaleString()} ({activeReport.gasRatio}%)
+                        {activeReport.gasUsed === 'Unavailable' || activeReport.gasUsed === 'Unavailable (simulation)' ? activeReport.gasUsed : Number(activeReport.gasUsed).toLocaleString()} /{' '}
+                        {activeReport.gasLimit === 'Unavailable' ? activeReport.gasLimit : Number(activeReport.gasLimit).toLocaleString()} ({activeReport.gasRatio ?? 'Unavailable'}%)
                       </span>
                     </div>
                     <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
@@ -1884,15 +1625,15 @@ export default function App() {
                             ? 'bg-amber-500'
                             : 'bg-emerald-500'
                         }`}
-                        style={{ width: `${Math.min(100, Math.max(6, Number(activeReport.gasRatio)))}%` }}
+                        style={{ width: `${Math.min(100, Math.max(6, Number(activeReport.gasRatio || 0)))}%` }}
                       />
                     </div>
                     <div className="flex justify-between text-[11px] font-semibold text-slate-600">
                       <span>Fee Paid: {activeReport.feeFormatted}</span>
                       <span className={Number(activeReport.gasRatio) >= 98 ? 'text-rose-700 font-bold' : 'text-emerald-700 font-bold'}>
-                        {Number(activeReport.gasRatio) >= 98
-                          ? '⚠️ Exhausted Gas Limit'
-                          : '✓ Within Gas Limit'}
+                        {activeReport.gasRatio === null ? 'Gas ratio unavailable' : Number(activeReport.gasRatio) >= 98
+                          ? 'Near gas limit; not proof of cause'
+                          : 'Below configured gas limit'}
                       </span>
                     </div>
                   </div>
@@ -1947,7 +1688,7 @@ export default function App() {
                         </div>
                       </div>
                       <div className="px-3 py-2 rounded-xl bg-slate-50 border border-slate-200/80">
-                        <div className="text-[11px] font-semibold text-slate-600">Sender Live Balance</div>
+                        <div className="text-[11px] font-semibold text-slate-600">Sender Balance at Block State</div>
                         <div className="font-mono font-extrabold text-slate-900 text-xs sm:text-sm mt-0.5 truncate">
                           {activeReport.senderBalanceFormatted}
                         </div>
@@ -1984,7 +1725,7 @@ export default function App() {
                   className="flex-1 py-2 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-900 font-bold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
                 >
                   <Code2 className="w-3.5 h-3.5" />
-                  <span>View Raw MCP / RPC Payload</span>
+                  <span>View Raw MCP / RPC Evidence</span>
                 </button>
                 {activeReport && (
                   <button
@@ -2030,6 +1771,10 @@ export default function App() {
             </div>
             <div className="p-6 overflow-y-auto font-mono text-xs bg-slate-950 text-emerald-400 space-y-4">
               <div>
+                <div className="text-slate-400 mb-1">// MCP transport, result, and fallback reason</div>
+                <pre className="whitespace-pre-wrap break-all">{JSON.stringify(activeReport.mcpProbe, null, 2)}</pre>
+              </div>
+              <div>
                 <div className="text-slate-400 mb-1">// 1. eth_getTransactionByHash</div>
                 <pre className="whitespace-pre-wrap break-all">
                   {JSON.stringify(activeReport.rawTx, null, 2)}
@@ -2047,6 +1792,12 @@ export default function App() {
                   <pre className="whitespace-pre-wrap break-all">
                     {JSON.stringify(activeReport.debugTrace, null, 2)}
                   </pre>
+                </div>
+              )}
+              {activeReport.rawSimulation && (
+                <div>
+                  <div className="text-slate-400 mb-1">// Simulation request and RPC error (not a mined receipt)</div>
+                  <pre className="whitespace-pre-wrap break-all">{JSON.stringify(activeReport.rawSimulation, null, 2)}</pre>
                 </div>
               )}
             </div>

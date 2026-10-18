@@ -102,3 +102,38 @@ Explore Pharos AI: https://ai.pharos.xyz/
 ---
 
 **Every failed transaction tells a story. This agent helps you understand it.**
+
+## Implementation and Local Development
+
+The React + Vite interface retrieves transaction evidence through configured JSON-RPC endpoints. Receipt status determines mined success/failure; eth_call and trace responses remain diagnostic evidence. Missing values remain unavailable.
+
+## Run locally
+
+1. Install dependencies with `npm install`.
+2. For Gemini explanations, set `GEMINI_API_KEY` in the shell that runs the proxy. The key stays on the server and is never sent to the browser. Optional: set `GEMINI_MODEL` or `AI_PROXY_PORT`.
+3. Start the proxy in one terminal: `npm run dev:ai-proxy`.
+4. Start Vite in another terminal: `npm run dev`.
+5. Open the local URL printed by Vite. If the proxy or provider is unavailable, on-chain inspection and its rule-based explanation continue to work.
+
+Without a configured API key, the AI proxy responds with a configuration error and no credential is exposed to the client. Production deployments must provide an authenticated, rate-limited server endpoint compatible with `POST /api/explain`; the Vite proxy is development-only.
+
+## Verify
+
+- `npm test` runs deterministic unit tests against utility functions. These use local data and do not claim live RPC evidence.
+- `npm run lint` runs Oxlint.
+- `npm run build` creates the production frontend bundle.
+
+## Manual test checklist
+
+- Select Atlantic Testnet, Pacific Mainnet, and Legacy Testnet; check chain ID, latest block, gas price, and recent transaction feed against the corresponding RPC/explorer.
+- Inspect a known successful and a known failed transaction on each network. Confirm that only receipt status `0x1`/`0x0` is classified as mined pass/fail.
+- Inspect a pending hash and an unknown hash. Confirm pending/missing receipt is not called failed and RPC/network errors are visible.
+- Check raw transaction/receipt/trace payloads and confirm replay results are identified as simulations.
+- Run each diagnostic probe. Confirm it reports a simulation, uses the returned RPC error, has no fabricated receipt/gas/fee/balance, and reports when the call does not fail.
+- Exercise invalid hash, malformed RPC response, RPC timeout, and unavailable MCP endpoint. Confirm the selected transport and fallback reason are truthful.
+- Configure the AI proxy and test valid response, missing key, provider rate limit, malformed response, and timeout. Confirm rule-based analysis remains available.
+- Test narrow viewport, modal close controls, copy buttons, loading states, and refresh during an in-progress scan.
+
+## Configuration and evidence notes
+
+Network RPC, MCP, and explorer endpoints are currently configured in `src/App.jsx`. This client app cannot independently certify provider availability or the provenance of configured token contract addresses. Diagnostic probes use the existing configured Atlantic addresses and should be treated as illustrative calls until independently checked against official Pharos deployment documentation. A successful simulation is never represented as a mined transaction.
