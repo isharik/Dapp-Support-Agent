@@ -82,6 +82,23 @@ const PHAROS_LOGO_PATHS = [
 
 const monotonicNow = () => globalThis.performance.now();
 
+function getTraceFailureDetails(trace) {
+  if (!trace || typeof trace !== 'object') return { error: '', revertReason: '', output: '' };
+  const calls = Array.isArray(trace.calls) ? trace.calls : [];
+  // Prefer the deepest failing call: callTracer often leaves the root error blank
+  // when a nested token/router call is the frame that actually reverted.
+  for (const call of calls) {
+    const childFailure = getTraceFailureDetails(call);
+    if (childFailure.error || childFailure.revertReason) return childFailure;
+  }
+  const failedFrame = Boolean(trace.error || trace.revertReason);
+  return {
+    error: typeof trace.error === 'string' ? trace.error : '',
+    revertReason: typeof trace.revertReason === 'string' ? trace.revertReason : '',
+    output: failedFrame && typeof trace.output === 'string' ? trace.output : ''
+  };
+}
+
 const PharosBrandLogo = ({ className = 'h-10' }) => {
   const [pathIdx, setPathIdx] = useState(0);
   const [imgFailed, setImgFailed] = useState(false);
@@ -398,9 +415,10 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
     ];
   } else {
     // 1. Check Out-Of-Gas condition (gasUsed >= 98.5% of gasLimit or trace error "out of gas")
-    const traceError = debugTraceResult?.error || '';
-    const traceRevertReason = debugTraceResult?.revertReason || '';
-    const traceOutput = debugTraceResult?.output || '';
+    const traceFailure = getTraceFailureDetails(debugTraceResult);
+    const traceError = traceFailure.error;
+    const traceRevertReason = traceFailure.revertReason;
+    const traceOutput = traceFailure.output;
 
     // Extract any revert hex from trace or eth_call replay
     let revertHex = null;
@@ -468,20 +486,24 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
       const cleanReason =
         traceRevertReason ||
         decodedRevert?.reason ||
-        (callReplayResult && !callReplayResult.ok ? callReplayResult.message : null) ||
-        `Smart contract at ${tx?.to?.slice(0, 10)}... rejected execution at selector ${methodSelector}`;
+        (traceError && !/^(execution reverted|revert|call exception|vm exception)$/i.test(traceError.trim()) ? `Transaction trace reports: ${traceError}` : null) ||
+        (callReplayResult && !callReplayResult.ok && !/^(execution reverted|revert|call exception|vm exception)$/i.test(callReplayResult.message.trim()) ? callReplayResult.message : null);
+      const hasSpecificReason = Boolean(cleanReason);
 
       diagnosis = {
         isFailed: true,
         category: 'Revert Reason',
         failureCode: decodedRevert?.signature || 'CONTRACT_REVERT',
-        technicalReason: `${cleanReason} (eth_call/debug trace is diagnostic simulation evidence; receipt status is the mined outcome.)`,
-        plainExplanation:
-          'The receipt confirms execution failed. The trace or replay provides a diagnostic clue, but the exact cause may depend on contract state and is not always recoverable from an RPC response.',
+        technicalReason: hasSpecificReason
+          ? `${cleanReason} (the receipt confirms the failure; trace/replay details are diagnostic evidence and may reflect a different state.)`
+          : `The mined receipt confirms EVM execution failed (status 0x0), but this RPC did not return a revert reason or usable trace. Target: ${tx?.to || 'contract creation'}; method: ${methodSelector}.`,
+        plainExplanation: hasSpecificReason
+          ? `This transaction was included on Pharos but the contract stopped execution: ${cleanReason}. The receipt proves it failed; the trace clue may not exactly reproduce the original block state.`
+          : 'This transaction was included on Pharos and definitely failed, but the RPC did not expose the contract’s specific reason. The failure is confirmed; its cause cannot be identified from the available node data. The target and method below can help you check the matching DApp action.',
         suggestedFixes: [
-          'Refresh the DApp page so it fetches the newest live prices and contract state.',
-          'If you are swapping tokens on a DEX, increase your Slippage Tolerance slightly (for example, from 0.5% to 1.5%).',
-          'Check that the offer, mint, or liquidity position is still active and has not already been executed.'
+          hasSpecificReason ? `Review the reported contract reason: ${cleanReason}` : 'Open the PharosScan transaction link and review its logs and input data for the contract action that failed.',
+          'Refresh the DApp and retry its simulation with the same inputs to see whether current contract state still rejects the action.',
+          'Avoid repeating the transaction unchanged until you have checked the amount, permissions, deadline, and any DApp-specific requirements.'
         ],
         revertHex
       };
@@ -552,6 +574,7 @@ export default function App() {
 
   // Live Discovered Transactions from Pharos RPC blocks
   const [liveDiscoveredTxs, setLiveDiscoveredTxs] = useState([]);
+  const [failedDiscoveredTxs, setFailedDiscoveredTxs] = useState([]);
   const [isScanningChain, setIsScanningChain] = useState(false);
   const [blocksScannedCount, setBlocksScannedCount] = useState(0);
 
@@ -592,6 +615,16 @@ export default function App() {
 
         // Record in discovered list if not already present and if it failed, mark its failure type as demonstrated
         if (report.diagnosis.isFailed) {
+          setFailedDiscoveredTxs((prev) => {
+            const discoveredFailure = {
+              hash: report.hash,
+              status: 'FAILED',
+              blockNumber: report.blockNumber,
+              networkId: report.network.id,
+              quickTag: report.diagnosis.category
+            };
+            return [discoveredFailure, ...prev.filter((item) => item.hash !== report.hash)].slice(0, 20);
+          });
           setFailureEvidenceRecords((prev) => ({
             ...prev,
             [report.diagnosis.category]: {
@@ -725,6 +758,11 @@ export default function App() {
           const map = new Map();
           [...enriched, ...prev].forEach((item) => map.set(item.hash, item));
           return Array.from(map.values()).slice(0, 14);
+        });
+        setFailedDiscoveredTxs((prev) => {
+          const map = new Map();
+          [...enriched.filter((item) => item.status === 'FAILED'), ...prev].forEach((item) => map.set(item.hash, item));
+          return Array.from(map.values()).slice(0, 20);
         });
 
         // On first load, automatically inspect the first discovered transaction (preferring a failed one if present)
@@ -1275,6 +1313,53 @@ export default function App() {
                     </button>
                   );
                 })}
+              </div>
+            </div>
+
+            {/* Failed transactions stay visible in their own list, with full hashes available to copy. */}
+            <div className="flex-1 min-h-0 bg-white rounded-2xl p-3.5 border border-rose-200/90 shadow-xs flex flex-col gap-2">
+              <div className="flex-shrink-0 flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] font-extrabold uppercase tracking-wider text-rose-700 flex items-center gap-1">
+                    <XCircle className="w-3 h-3" />
+                    Mined receipts with status 0x0
+                  </span>
+                  <h3 className="text-sm font-extrabold text-slate-900">Failed Transactions ({failedDiscoveredTxs.length})</h3>
+                </div>
+                <button
+                  onClick={() => scanRecentPharosBlocks(selectedNetwork, false)}
+                  disabled={isScanningChain}
+                  className="p-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 transition-colors cursor-pointer disabled:opacity-50"
+                  title="Refresh failed transactions"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isScanningChain ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-1.5 pr-1">
+                {failedDiscoveredTxs.length === 0 ? (
+                  <div className="py-4 text-center text-xs font-medium text-slate-500">
+                    {isScanningChain ? 'Scanning recent blocks for failed receipts…' : 'No failed transactions found in the recent scanned blocks.'}
+                  </div>
+                ) : failedDiscoveredTxs.map((item) => (
+                  <div key={item.hash} className="flex items-center gap-1.5 rounded-xl border border-rose-100 bg-rose-50/60 px-2 py-1.5">
+                    <button
+                      onClick={() => inspectTransaction(item.hash, item.networkId)}
+                      title={`Inspect failed transaction ${item.hash}`}
+                      className="min-w-0 flex-1 text-left cursor-pointer"
+                    >
+                      <span className="block text-[10px] font-extrabold text-rose-700">FAILED • Block #{item.blockNumber}</span>
+                      <span className="block break-all font-mono text-[10px] leading-tight font-semibold text-slate-800">{item.hash}</span>
+                    </button>
+                    <button
+                      onClick={() => handleCopy(item.hash, item.hash)}
+                      title="Copy full transaction hash"
+                      aria-label="Copy full transaction hash"
+                      className="flex-shrink-0 p-1.5 rounded-lg text-slate-500 hover:bg-white hover:text-blue-700 cursor-pointer"
+                    >
+                      {copiedText === item.hash ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                ))}
               </div>
             </div>
 
