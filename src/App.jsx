@@ -489,22 +489,62 @@ async function analyzeLivePharosTransaction(txHash, preferredNetworkKey = 'atlan
         (traceError && !/^(execution reverted|revert|call exception|vm exception)$/i.test(traceError.trim()) ? `Transaction trace reports: ${traceError}` : null) ||
         (callReplayResult && !callReplayResult.ok && !/^(execution reverted|revert|call exception|vm exception)$/i.test(callReplayResult.message.trim()) ? callReplayResult.message : null);
       const hasSpecificReason = Boolean(cleanReason);
+      const hasUnknownCustomError = decodedRevert?.reason?.startsWith('Unknown custom error');
+      const gasContext = gasRatio === null
+        ? ''
+        : gasRatio < 98
+        ? ` The transaction used ${gasRatio.toFixed(1)}% of its gas limit (${gasUsed.toLocaleString()} of ${gasLimit.toLocaleString()}), so it did not run out of gas.`
+        : ` It used ${gasRatio.toFixed(1)}% of its gas limit (${gasUsed.toLocaleString()} of ${gasLimit.toLocaleString()}); this is high, but does not by itself prove an out-of-gas failure.`;
+      const feeContext = feeWei === null ? '' : ` (${formatUnits(`0x${feeWei.toString(16)}`, 18, 6)} ${foundNetwork.symbol})`;
+      const isInsufficientAllowance = failureCategory === 'Insufficient Allowance';
+      const isInsufficientBalance = failureCategory === 'Insufficient Balance';
+      const isOutOfGas = failureCategory === 'Out of Gas';
+      const isSlippage = /slippage|price impact|minimum output/i.test(cleanReason || '');
+      const isDeadline = /deadline|expired/i.test(cleanReason || '');
+      const isUnauthorized = /unauthori[sz]ed|only owner|access control/i.test(cleanReason || '');
+      const userFacingReason = isInsufficientAllowance
+        ? 'The app tried to spend a token, but it does not have permission to spend enough yet.'
+        : isInsufficientBalance
+        ? 'The wallet does not have enough of the token for this amount.'
+        : isOutOfGas
+        ? 'The transaction ran out of computation fuel before the contract could finish.'
+        : isSlippage
+        ? 'The token price moved beyond the change you allowed while the transaction was being processed.'
+        : isDeadline
+        ? 'The request expired before it could be completed.'
+        : isUnauthorized
+        ? 'The connected wallet is not allowed to perform this action.'
+        : hasUnknownCustomError
+        ? `The contract rejected the request with error code ${decodedRevert.signature}. This code has no readable name in the data returned by Pharos, so the exact contract rule cannot be confirmed.${gasContext}`
+        : hasSpecificReason
+        ? `The contract rejected the request: ${cleanReason}.${gasContext}`
+        : `Pharos confirms that the transaction failed, but the node did not return a readable reason. The contract stopped the request before it completed.${gasContext}`;
+      const recommendedFixes = isInsufficientAllowance
+        ? ['Approve this token for the DApp, then wait for the approval to confirm.', 'Make sure the approval covers at least the amount you are trying to use.', 'Retry the action after the DApp shows the updated allowance.']
+        : isInsufficientBalance
+        ? ['Reduce the amount so it is no more than the token balance shown in your wallet.', `Keep enough ${foundNetwork.symbol} in the wallet to pay the network fee.`, 'Refresh the wallet balance and try again only after the needed funds are available.']
+        : isOutOfGas
+        ? ['Use the wallet’s automatic gas estimate; do not lower the gas limit manually.', 'If the DApp lets you review the estimate, simulate the transaction again before sending.', 'Retry only after the wallet or DApp provides a sufficient gas estimate.']
+        : isSlippage
+        ? ['Refresh the quote so it uses the latest token price.', 'If the price is moving quickly, adjust the DApp’s slippage setting slightly and review the new minimum output before confirming.', 'Submit the refreshed transaction before its quote expires.']
+        : isDeadline
+        ? ['Refresh or create a new quote to get a current deadline.', 'Confirm the transaction promptly after reviewing the wallet details.']
+        : isUnauthorized
+        ? ['Switch to the wallet that is permitted to perform this action, if you control one.', 'If you believe this wallet should have access, ask the DApp or contract administrator to confirm its permissions.']
+        : hasUnknownCustomError
+        ? ['Do not resend the same request unchanged. Refresh the DApp and create a new request using its latest quote and contract state.', 'Check the exact amount, recipient, token balance, and token approval shown by the DApp before trying again.', 'If it fails again, send DApp support the transaction hash and this error code; the Pharos response does not include enough information to safely name the blocked rule.']
+        : ['Check the DApp’s amount, recipient, and any quote or deadline, then refresh its data before creating a new request.', 'Confirm the wallet has enough of the token and has approved the amount, if the action needs token approval.', 'If the same error returns, share the transaction hash and error code with the DApp support team so they can identify that contract-specific rule.'];
 
       diagnosis = {
         isFailed: true,
         category: 'Revert Reason',
         failureCode: decodedRevert?.signature || 'CONTRACT_REVERT',
+        reasonIdentified: hasSpecificReason && !hasUnknownCustomError,
         technicalReason: hasSpecificReason
           ? `${cleanReason} (the receipt confirms the failure; trace/replay details are diagnostic evidence and may reflect a different state.)`
           : `The mined receipt confirms EVM execution failed (status 0x0), but this RPC did not return a revert reason or usable trace. Target: ${tx?.to || 'contract creation'}; method: ${methodSelector}.`,
-        plainExplanation: hasSpecificReason
-          ? `This transaction was included on Pharos but the contract stopped execution: ${cleanReason}. The receipt proves it failed; the trace clue may not exactly reproduce the original block state.`
-          : 'This transaction was included on Pharos and definitely failed, but the RPC did not expose the contract’s specific reason. The failure is confirmed; its cause cannot be identified from the available node data. The target and method below can help you check the matching DApp action.',
-        suggestedFixes: [
-          hasSpecificReason ? `Review the reported contract reason: ${cleanReason}` : 'Open the PharosScan transaction link and review its logs and input data for the contract action that failed.',
-          'Refresh the DApp and retry its simulation with the same inputs to see whether current contract state still rejects the action.',
-          'Avoid repeating the transaction unchanged until you have checked the amount, permissions, deadline, and any DApp-specific requirements.'
-        ],
+        plainExplanation: `Pharos confirms this transaction failed. Any contract changes were undone, and you still paid the network fee${feeContext}. ${userFacingReason}`,
+        suggestedFixes: recommendedFixes,
         revertHex
       };
     }
@@ -540,7 +580,12 @@ async function generateAiSupportExplanation(txReport) {
   const report = {
     hash: txReport.hash, status: txReport.status, statusHex: txReport.statusHex,
     network: { name: txReport.network.name, chainId: txReport.network.chainId },
-    diagnosis: { category: txReport.diagnosis.category, technicalReason: txReport.diagnosis.technicalReason },
+    diagnosis: {
+      category: txReport.diagnosis.category,
+      technicalReason: txReport.diagnosis.technicalReason,
+      plainExplanation: txReport.diagnosis.plainExplanation,
+      suggestedFixes: txReport.diagnosis.suggestedFixes
+    },
     valueFormatted: txReport.valueFormatted, gasUsed: txReport.gasUsed, gasLimit: txReport.gasLimit,
     methodSelector: txReport.methodSelector
   };
@@ -1522,7 +1567,7 @@ export default function App() {
                     ) : (
                       <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                     )}
-                    <span>{activeReport?.isLiveRpcProbe ? 'Simulation Diagnosis' : 'Octopus Support Diagnosis'}</span>
+                    <span>{activeReport?.isLiveRpcProbe ? 'Simulation result' : activeReport?.status === 'FAILED' ? 'Why it failed' : 'Transaction result'}</span>
                     {isAiLoading && (
                       <span className="text-[11px] text-slate-600 font-semibold animate-pulse">
                         • AI Refining...
@@ -1543,7 +1588,7 @@ export default function App() {
                     {!activeReport
                       ? 'Ready to Inspect Any Pharos Transaction'
                       : activeReport.status === 'FAILED'
-                      ? `Mined transaction failed: ${activeReport.diagnosis.category}`
+                      ? `Mined transaction failed: ${activeReport.diagnosis.reasonIdentified === false ? 'contract rule not identified' : activeReport.diagnosis.category === 'Insufficient Allowance' ? 'token approval was too low' : activeReport.diagnosis.category === 'Insufficient Balance' ? 'token balance was too low' : activeReport.diagnosis.category === 'Out of Gas' ? 'it ran out of gas' : activeReport.diagnosis.category === 'Revert Reason' ? 'the contract rejected the request' : activeReport.diagnosis.category}`
                       : activeReport.status === 'PASSED'
                       ? 'Your transaction succeeded on Pharos.'
                       : activeReport.isLiveRpcProbe
@@ -1562,6 +1607,8 @@ export default function App() {
                   >
                     {!activeReport
                       ? 'Select any live transaction from the left feed, paste a 0x transaction hash above, or click one of the 4 live RPC failure probes to see a plain-English diagnosis.'
+                      : activeReport.diagnosis.reasonIdentified === false
+                      ? activeReport.diagnosis.plainExplanation
                       : aiEnhanced?.plainEnglishWhy || activeReport.diagnosis.plainExplanation}
                   </p>
                 </div>
@@ -1583,7 +1630,7 @@ export default function App() {
                   </div>
 
                   <div className="grid grid-cols-1 gap-1.5">
-                    {(aiEnhanced?.stepByStepFixes || activeReport.diagnosis.suggestedFixes).map(
+                    {(activeReport.diagnosis.reasonIdentified === false ? activeReport.diagnosis.suggestedFixes : aiEnhanced?.stepByStepFixes || activeReport.diagnosis.suggestedFixes).map(
                       (step, idx) => (
                         <div
                           key={idx}
